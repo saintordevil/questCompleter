@@ -1,4 +1,4 @@
-# QuestCompleter
+# Vencord: Quest Completer
 
 Discord Quest automation for Vencord: enroll in available quests, complete supported desktop objectives, and claim rewards in the background.
 
