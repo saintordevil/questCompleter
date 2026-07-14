@@ -1,76 +1,75 @@
 # Vencord: Quest Completer
 
-Discord Quest automation for Vencord: enroll in available quests, complete supported desktop objectives, and claim rewards in the background.
+QuestCompleter is a source-only Vencord userplugin that handles eligible Discord quests in the background. It can enroll in supported quests, progress their desktop objectives, claim completed rewards when Discord permits it, and keep a local history of successful automatic claims.
 
-QuestCompleter monitors Discord's quest stores, handles supported quest types automatically, and re-checks progress after reconnects. It is designed to run quietly once enabled, with no manual quest interaction required unless Discord requires a CAPTCHA or the quest type is not desktop-completable.
+The plugin is also searchable as **QuestComputer** in Vencord's plugin list.
 
-## Core Behavior
+## Features
 
-| Feature | What it does |
-|---|---|
-| **Auto-Enroll** | Enrolls in available Discord quests as they appear |
-| **Auto-Complete** | Completes supported quest objectives without manually managing quest progress |
-| **Auto-Claim** | Claims quest rewards as soon as objectives are finished |
-| **Background Polling** | Checks for new quests and progress updates every 60 seconds |
-| **Reconnect Aware** | Re-checks quests automatically after Discord reconnects |
+- Enrolls in eligible active quests with supported desktop tasks
+- Progresses one supported quest at a time, prioritizing the nearest expiry
+- Claims completed, unclaimed rewards before their reward expiry
+- Polls every 60 seconds and schedules faster checks after relevant Discord quest events
+- Prevents overlapping cycles and duplicate enrollment, completion, and claim work
+- Applies exponential retry backoff after failures
+- Cancels active work and restores temporary store patches when disabled or reconnected
+- Persists a completion count and the 50 most recent successful automatic claims
+- Provides a Vencord settings panel for viewing history and resetting local statistics
 
-## Supported Quest Types
+## Supported Quest Tasks
 
-| Task Type | Method | Notes |
+| Discord task | Handling | Limitation |
 |---|---|---|
-| **Watch Video** | Sends video progress timestamps to the API until complete | Desktop-completable |
-| **Play on Desktop** | Spoofs a running game process so Discord sees the required game as active | Desktop-completable |
-| **Stream on Desktop** | Spoofs stream metadata for the required application | Requires being in a voice channel with at least one other person |
-| **Play Activity** | Sends heartbeat pings against a channel until the time requirement is met | Desktop-completable |
+| `WATCH_VIDEO` | Reports bounded video progress until Discord marks the objective complete | Stops after repeated errors and retries the quest later |
+| `PLAY_ON_DESKTOP` | Uses the real required game when detected, otherwise temporarily adds a matching game to Discord's running-game store | Depends on Discord's desktop quest heartbeat behavior |
+| `STREAM_ON_DESKTOP` | Temporarily reports the required application as the active stream | You must stream a window in voice chat, and Discord requires at least one other viewer |
+| `PLAY_ACTIVITY` | Sends quest-specific activity heartbeats until complete | Depends on Discord accepting the activity heartbeat format |
 
-Mobile-only tasks such as `WATCH_VIDEO_ON_MOBILE` are skipped because they cannot be completed on desktop.
+Unsupported task types, including mobile-only objectives such as `WATCH_VIDEO_ON_MOBILE`, are skipped.
+
+## Statistics and Settings
+
+After the plugin successfully claims a reward, it stores the quest name, quest ID, and claim time in Vencord's local data store. Duplicate quest IDs are not counted twice, and history is limited to the 50 most recent entries.
+
+Open **Discord Settings > Vencord > Plugins > QuestCompleter** to view:
+
+- The number of rewards successfully claimed by the plugin
+- Recent quest names and claim times
+- A **Reset stats** button that clears the local count and history
+
+Manual claims are not added to this local history.
+
+## Reliability and Cleanup
+
+For enrollment and progression, QuestCompleter ignores preview, future, and expired quests. Completed rewards remain claimable while their reward expiry is still valid. Enrollment, claim, and completion failures use bounded exponential backoff so a failing quest does not create a tight request loop.
+
+Only one processing cycle and one completion job can be active at a time. Disabling the plugin aborts pending waits, removes Flux listeners, clears timers, and restores any temporary game or stream store functions. A Discord reconnect replaces the runtime generation so requests started under an earlier connection cannot update the new runtime's retry or deduplication state.
 
 ## Requirements
 
-- A working [Vencord](https://vencord.dev) development setup
 - Discord desktop
+- A working [Vencord development setup](https://docs.vencord.dev/installing/)
 - `pnpm`, as used by Vencord
-- A voice channel with at least one other person for stream quests
+- For stream quests, a voice chat stream with at least one other viewer
 
-## Install
+## Installation
 
-1. Set up [Vencord](https://vencord.dev) if you have not already.
-2. Copy the `questCompleter` folder into your Vencord `src/userplugins/` directory.
-3. Rebuild Vencord:
+This repository contains a Vencord userplugin source folder, not a standalone npm package.
 
-```bash
-pnpm build
-```
+1. Copy the `questCompleter` folder into `src/userplugins/` in your Vencord checkout.
+2. Build Vencord using the instructions for your installation.
+3. Enable **QuestCompleter** in **Discord Settings > Vencord > Plugins**.
 
-4. Enable **QuestCompleter** in Discord Settings > Vencord > Plugins.
+The plugin entrypoint is `index.tsx` because its settings panel uses JSX.
 
-## Usage
+## Limitations
 
-Once enabled, QuestCompleter starts automatically with Discord.
-
-The plugin waits for Discord's stores to load, then runs an initial quest check after startup. It continues polling every 60 seconds and runs another check when Discord reconnects.
-
-## How It Works
-
-QuestCompleter hooks into Discord's internal Flux stores to discover available quests and track progress. It uses Discord's own REST API endpoints to enroll in quests, report progress, send heartbeats, and claim completed rewards.
-
-For play and stream quests, QuestCompleter temporarily patches Discord's `RunningGameStore` or `ApplicationStreamingStore` so Discord sees the required game as running or streaming. After the quest is complete, the temporary patches are removed.
-
-## Technical Details
-
-- Discovers the quest store at runtime by scanning registered Flux stores
-- Supports `WATCH_VIDEO`, `PLAY_ON_DESKTOP`, `STREAM_ON_DESKTOP`, and `PLAY_ACTIVITY`
-- Uses `/quests/{id}/enroll`, `/quests/{id}/video-progress`, `/quests/{id}/heartbeat`, and `/quests/{id}/claim-reward`
-- Polls every 60 seconds while enabled
-- Cleans up active spoofing patches when stopped or after quest completion
-
-## Notes
-
-- Some quest rewards may require a CAPTCHA and must be claimed manually
-- Stream quests require a voice channel with at least one other person
-- Mobile-only quests are intentionally skipped
-- The plugin waits for Discord's stores to load before attempting actions
+- Discord may require a CAPTCHA for a reward claim. The plugin logs the failure and retries with backoff, but you may need to claim that reward manually.
+- Stream quests are not fully unattended. You must start a stream, and another viewer must be present for Discord to grant progress.
+- Mobile-only and unknown quest task types are intentionally skipped.
+- The plugin relies on Discord's private stores, Flux events, and quest endpoints. Discord updates can require maintenance.
+- Quest automation may be subject to Discord's rules and enforcement. Use it at your own discretion.
 
 ## License
 
-MIT
+[GNU General Public License v3.0 or later](LICENSE)
