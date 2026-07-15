@@ -7,6 +7,7 @@
 import * as DataStore from "@api/DataStore";
 import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
+import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import {
     ApplicationStreamingStore,
     Button,
@@ -20,6 +21,8 @@ import {
     useState
 } from "@webpack/common";
 
+import { assessClaimResponse, calculateRetryDelay, classifyClaimFailure, normalizeJoinOperator, prioritizeTaskNames, resolveTask, RUNNABLE_TASKS, selectClaimLocation, selectClaimPlatform, SERVER_BOUND_TASKS, TaskName } from "./logic";
+
 const logger = new Logger("QuestCompleter");
 
 const DS_COUNT_KEY = "QuestCompleter_completedCount";
@@ -30,11 +33,30 @@ const POLL_INTERVAL_MS = 60_000;
 const ACTION_DELAY_MS = 1_500;
 const QUEST_TIMEOUT_BUFFER_MS = 10 * 60_000;
 const MAX_QUEST_TIMEOUT_MS = 2 * 60 * 60_000;
-
-const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY"] as const;
-
-type TaskName = typeof SUPPORTED_TASKS[number];
+const CLAIM_RECONCILE_TIMEOUT_MS = 5000;
+const KNOWN_TASKS = new Set<string>([...RUNNABLE_TASKS, ...SERVER_BOUND_TASKS]);
 type Cleanup = () => void;
+
+interface CaptchaModule {
+    CaptchaCancelError?: new (...args: never[]) => Error;
+}
+
+const Captcha = findByPropsLazy("CaptchaCancelError", "extractCaptchaPropsFromResponse") as CaptchaModule;
+
+type ClaimQuestReward = (questId: string, platform: number, location: number) => Promise<unknown>;
+const claimQuestReward = findByCodeLazy(
+    "QUESTS_CLAIM_REWARD_BEGIN",
+    "QUESTS_CLAIM_REWARD_SUCCESS",
+    "QUESTS_CLAIM_REWARD_FAILURE",
+    "traffic_metadata_sealed"
+) as ClaimQuestReward;
+
+type FetchQuestRewardCode = (questId: string) => Promise<unknown>;
+const fetchQuestRewardCode = findByCodeLazy(
+    "QUESTS_FETCH_REWARD_CODE_BEGIN",
+    "QUESTS_FETCH_REWARD_CODE_SUCCESS",
+    "QUESTS_FETCH_REWARD_CODE_FAILURE"
+) as FetchQuestRewardCode;
 
 interface HistoryEntry {
     questId?: string;
@@ -61,6 +83,8 @@ interface QuestUserStatus {
 
 interface QuestTaskConfig {
     tasks?: Record<string, unknown>;
+    joinOperator?: unknown;
+    join_operator?: unknown;
 }
 
 interface Quest {
@@ -71,8 +95,9 @@ interface Quest {
         configVersion?: unknown;
         expiresAt?: unknown;
         startsAt?: unknown;
+        features?: unknown;
         messages?: { questName?: unknown; };
-        rewardsConfig?: { rewardsExpireAt?: unknown; };
+        rewardsConfig?: { rewards?: unknown; rewardsExpireAt?: unknown; platforms?: unknown; };
         taskConfig?: QuestTaskConfig;
         taskConfigV2?: QuestTaskConfig;
     };
@@ -81,8 +106,11 @@ interface Quest {
 
 interface QuestStoreLike {
     quests: Map<string, unknown>;
+    questEnrollmentBlockedUntil?: unknown;
     getName?: () => string;
     getQuest?: (id: string) => unknown;
+    getRewardCode?: (id: string) => unknown;
+    selectedTaskPlatform?: (id: string) => unknown;
 }
 
 interface TaskSelection {
@@ -103,14 +131,24 @@ interface RuntimeState {
     scheduledCycleAt: number;
     cyclePromise: Promise<void> | null;
     cycleQueued: boolean;
+    enrollQueuePromise: Promise<void> | null;
+    claimQueuePromise: Promise<void> | null;
     activeJob: QuestJob | null;
     successfulEnrollments: Map<string, number>;
     successfulClaims: Set<string>;
+    inFlightClaims: Set<string>;
+    claimNames: Map<string, string>;
     completedQuestIds: Map<string, number>;
+    blockedQuestIds: Set<string>;
     enrollRetries: Map<string, RetryEntry>;
     claimRetries: Map<string, RetryEntry>;
     questRetries: Map<string, RetryEntry>;
     lastStoreWarningAt: number;
+    observedSchemaFingerprint: string;
+    observedTaskNames: string[];
+    observedUnsupportedTaskNames: string[];
+    observedMobileHandoffs: number;
+    remoteCleanupAllowed: boolean;
 }
 
 interface QuestJob {
@@ -127,9 +165,21 @@ class CancelledError extends Error {
     }
 }
 
+class TerminalQuestError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "TerminalQuestError";
+    }
+}
+
 let questsStore: QuestStoreLike | null = null;
 let runtime: RuntimeState | null = null;
 let statsWriteTail: Promise<void> = Promise.resolve();
+const runtimeListeners = new Set<() => void>();
+
+function emitRuntimeChange(): void {
+    for (const listener of runtimeListeners) listener();
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null;
@@ -154,20 +204,44 @@ function hasTimestamp(value: unknown): boolean {
 }
 
 function getErrorSummary(error: unknown): string {
-    const status = isRecord(error) && (typeof error.status === "number" || typeof error.status === "string")
-        ? `HTTP ${String(error.status)}`
+    const response = isRecord(error) && isRecord(error.response) ? error.response : null;
+    const rawStatus = isRecord(error) ? error.status ?? error.statusCode ?? response?.status ?? response?.statusCode : null;
+    const status = typeof rawStatus === "number" || (typeof rawStatus === "string" && /^\d{3}$/.test(rawStatus))
+        ? `HTTP ${String(rawStatus)}`
         : null;
-    const message = error instanceof Error && error.message
-        ? error.message
-        : isRecord(error) && typeof error.message === "string"
-            ? error.message
+    const body = isRecord(error) && isRecord(error.body)
+        ? error.body
+        : isRecord(response?.body)
+            ? response.body
+            : isRecord(response?.data)
+                ? response.data
+                : null;
+    const rawCode = body?.code;
+    const code = typeof rawCode === "number" && Number.isInteger(rawCode) && rawCode >= 0
+        ? `code ${rawCode}`
+        : typeof rawCode === "string" && /^\d{1,10}$/.test(rawCode)
+            ? `code ${rawCode}`
             : null;
-    return [status, message].filter(Boolean).join(": ").slice(0, 240) || "Unknown error";
+    const errorName = error instanceof Error && /^[A-Za-z][A-Za-z0-9]*Error$/.test(error.name)
+        ? error.name
+        : null;
+    return [status, code, errorName].filter(Boolean).join(": ") || "Unknown error";
+}
+
+function isDiscordCaptchaCancelError(error: unknown): boolean {
+    try {
+        const { CaptchaCancelError } = Captcha;
+        return typeof CaptchaCancelError === "function" && error instanceof CaptchaCancelError;
+    } catch {
+        return false;
+    }
 }
 
 function isTerminalQuestError(error: unknown): boolean {
+    if (error instanceof TerminalQuestError) return true;
     if (!isRecord(error)) return false;
-    const status = Number(error.status);
+    const response = isRecord(error.response) ? error.response : null;
+    const status = Number(error.status ?? error.statusCode ?? response?.status ?? response?.statusCode);
     return [400, 401, 403, 404, 409, 410].includes(status);
 }
 
@@ -296,10 +370,29 @@ function getQuestById(id: string): Quest | null {
 
 function getQuestName(quest: Quest): string {
     const name = quest.config.messages?.questName;
-    return typeof name === "string" && name.trim() ? name.trim().slice(0, 200) : quest.id;
+    return typeof name === "string" && name.trim() ? name.trim().slice(0, 200) : "Unnamed quest";
 }
 
-function getApplicationId(quest: Quest): string | null {
+function getTaskConfig(quest: Quest): QuestTaskConfig | null {
+    const configVersion = asFiniteNumber(quest.config.configVersion);
+    if (configVersion === 1) return quest.config.taskConfig ?? quest.config.taskConfigV2 ?? null;
+    return quest.config.taskConfigV2 ?? quest.config.taskConfig ?? null;
+}
+
+function isRunnableTaskName(value: string): value is TaskName {
+    return (RUNNABLE_TASKS as readonly string[]).includes(value);
+}
+
+function getApplicationId(quest: Quest, taskName?: string): string | null {
+    if (taskName) {
+        const rawTask = getTaskConfig(quest)?.tasks?.[taskName];
+        if (isRecord(rawTask) && Array.isArray(rawTask.applications)) {
+            for (const application of rawTask.applications) {
+                if (isRecord(application) && isSnowflake(application.id)) return application.id;
+            }
+        }
+    }
+
     const id = quest.config.application?.id;
     return isSnowflake(id) ? id : null;
 }
@@ -309,7 +402,7 @@ function getApplicationName(quest: Quest): string {
     return typeof name === "string" && name.trim() ? name.trim().slice(0, 200) : getQuestName(quest);
 }
 
-function getProgress(userStatus: QuestUserStatus | null | undefined, taskName: TaskName, configVersion?: unknown): number {
+function getProgress(userStatus: QuestUserStatus | null | undefined, taskName: string, configVersion?: unknown): number {
     const rawProgress = configVersion === 1 && taskName === "STREAM_ON_DESKTOP"
         ? userStatus?.streamProgressSeconds
         : userStatus?.progress?.[taskName]?.value;
@@ -318,23 +411,44 @@ function getProgress(userStatus: QuestUserStatus | null | undefined, taskName: T
 }
 
 function getTaskSelection(quest: Quest): TaskSelection | null {
-    const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+    const taskConfig = getTaskConfig(quest);
     const tasks = taskConfig?.tasks;
     if (!isRecord(tasks)) return null;
 
-    for (const name of SUPPORTED_TASKS) {
+    let selectedPlatform: unknown;
+    try {
+        selectedPlatform = getQuestsStore()?.selectedTaskPlatform?.(quest.id);
+    } catch {
+        selectedPlatform = null;
+    }
+    const orderedNames = [
+        ...prioritizeTaskNames(RUNNABLE_TASKS, selectedPlatform),
+        ...Object.keys(tasks).filter(name => !(RUNNABLE_TASKS as readonly string[]).includes(name))
+    ];
+    const candidates = orderedNames.flatMap(name => {
         const rawTask = tasks[name];
-        if (!isRecord(rawTask)) continue;
+        if (!isRecord(rawTask)) return [];
 
         const target = asFiniteNumber(rawTask.target);
-        if (target === null || target <= 0) continue;
-        if ((name === "PLAY_ON_DESKTOP" || name === "STREAM_ON_DESKTOP") && !getApplicationId(quest)) continue;
+        if (target === null || target <= 0) return [];
 
         const progress = Math.min(target, getProgress(quest.userStatus, name, quest.config.configVersion));
-        if (progress < target) return { name, target, progress };
-    }
+        const needsApplication = name === "PLAY_ON_DESKTOP" || name === "STREAM_ON_DESKTOP";
+        const runnable = isRunnableTaskName(name) && (!needsApplication || getApplicationId(quest, name) !== null);
+        return [{ name, target, progress, runnable }];
+    });
 
-    return null;
+    const resolution = resolveTask(
+        candidates,
+        normalizeJoinOperator(taskConfig?.joinOperator ?? taskConfig?.join_operator)
+    );
+    if (!resolution.selected || !isRunnableTaskName(resolution.selected.name)) return null;
+
+    return {
+        name: resolution.selected.name,
+        target: resolution.selected.target,
+        progress: resolution.selected.progress
+    };
 }
 
 function isQuestActive(quest: Quest): boolean {
@@ -423,22 +537,19 @@ function cleanupJob(job: QuestJob): void {
 function cancelActiveJob(state: RuntimeState, reason: string): void {
     const job = state.activeJob;
     if (!job) return;
-    logger.info(`Cancelling active quest ${job.questId}: ${reason}`);
+    logger.info(`Cancelling active quest operation: ${reason}`);
     cleanupJob(job);
     if (state.activeJob === job) state.activeJob = null;
 }
 
 function retryReady(retries: Map<string, RetryEntry>, id: string): boolean {
     const retry = retries.get(id);
-    if (!retry) return true;
-    if (retry.retryAt > Date.now()) return false;
-    retries.delete(id);
-    return true;
+    return !retry || retry.retryAt <= Date.now();
 }
 
 function markRetry(retries: Map<string, RetryEntry>, id: string, baseDelay: number, maxDelay: number): RetryEntry {
     const failures = Math.min(10, (retries.get(id)?.failures ?? 0) + 1);
-    const delay = Math.min(maxDelay, baseDelay * 2 ** (failures - 1));
+    const delay = calculateRetryDelay(failures, baseDelay, maxDelay);
     const entry = { failures, retryAt: Date.now() + delay };
     retries.set(id, entry);
     return entry;
@@ -486,15 +597,116 @@ function queueCycle(state: RuntimeState): void {
         });
 }
 
+function updateObservedSchema(state: RuntimeState): void {
+    const taskCounts = new Map<string, number>();
+    const joinCounts = new Map<string, number>();
+    let mobileHandoffs = 0;
+
+    for (const quest of getAllQuests()) {
+        if (!isQuestActive(quest)) continue;
+        const taskConfig = getTaskConfig(quest);
+        if (!isRecord(taskConfig?.tasks)) continue;
+
+        const joinOperator = normalizeJoinOperator(taskConfig?.joinOperator ?? taskConfig?.join_operator);
+        joinCounts.set(joinOperator, (joinCounts.get(joinOperator) ?? 0) + 1);
+        for (const rawName of Object.keys(taskConfig.tasks)) {
+            const name = /^[A-Za-z0-9_:-]{1,80}$/.test(rawName) ? rawName : "<invalid>";
+            taskCounts.set(name, (taskCounts.get(name) ?? 0) + 1);
+        }
+
+        if (Array.isArray(quest.config.features) && quest.config.features.some(feature => feature === 7 || feature === 23)) {
+            mobileHandoffs++;
+        }
+    }
+
+    const taskNames = Array.from(taskCounts.keys()).sort();
+    const unsupportedTaskNames = taskNames.filter(name => !KNOWN_TASKS.has(name) || (SERVER_BOUND_TASKS as readonly string[]).includes(name));
+    const fingerprint = JSON.stringify({
+        tasks: Array.from(taskCounts.entries()).sort(([left], [right]) => left.localeCompare(right)),
+        joins: Array.from(joinCounts.entries()).sort(([left], [right]) => left.localeCompare(right)),
+        mobileHandoffs
+    });
+    if (state.observedSchemaFingerprint === fingerprint) return;
+
+    state.observedSchemaFingerprint = fingerprint;
+    state.observedTaskNames = taskNames;
+    state.observedUnsupportedTaskNames = unsupportedTaskNames;
+    state.observedMobileHandoffs = mobileHandoffs;
+    logger.info(
+        `Observed active quest schema: tasks=${taskNames.join(",") || "none"}; `
+        + `joins=${Array.from(joinCounts.entries()).map(([name, count]) => `${name}:${count}`).join(",") || "none"}; `
+        + `mobile-handoffs=${mobileHandoffs}.`
+    );
+    emitRuntimeChange();
+}
+
+async function finalizeClaimDetails(state: RuntimeState, questId: string, questName: string): Promise<void> {
+    if (state.successfulClaims.has(questId)) return;
+
+    state.successfulClaims.add(questId);
+    state.claimRetries.delete(questId);
+    state.claimNames.delete(questId);
+    emitRuntimeChange();
+
+    try {
+        await recordCompletion(questId, questName);
+        emitRuntimeChange();
+    } catch (error) {
+        logger.error(`Claimed ${questName}, but failed to update local stats: ${getErrorSummary(error)}`);
+    }
+}
+
+async function finalizeClaim(state: RuntimeState, quest: Quest): Promise<void> {
+    return finalizeClaimDetails(state, quest.id, getQuestName(quest));
+}
+
+async function waitForClaimReconciliation(state: RuntimeState, questId: string): Promise<boolean> {
+    const deadline = Date.now() + CLAIM_RECONCILE_TIMEOUT_MS;
+    while (isCurrentRuntime(state) && Date.now() < deadline) {
+        if (hasTimestamp(getQuestById(questId)?.userStatus?.claimedAt)) return true;
+        await sleep(250, state.controller.signal);
+    }
+    return false;
+}
+
+async function tryRecoverRewardCodeClaim(state: RuntimeState, quest: Quest): Promise<boolean> {
+    if (selectClaimLocation(quest.config.rewardsConfig?.rewards) !== 25) return false;
+
+    try {
+        await fetchQuestRewardCode(quest.id);
+        if (!isCurrentRuntime(state)) return false;
+
+        const storedRewardCode = getQuestsStore()?.getRewardCode?.(quest.id);
+        if (isRecord(storedRewardCode) && (
+            hasTimestamp(storedRewardCode.claimedAt) || hasTimestamp(storedRewardCode.claimed_at)
+        )) return true;
+
+        return waitForClaimReconciliation(state, quest.id);
+    } catch (error) {
+        logger.warn(`Reward-code recovery did not confirm ${getQuestName(quest)}: ${getErrorSummary(error)}`);
+        return false;
+    }
+}
+
 async function autoEnroll(state: RuntimeState): Promise<void> {
+    const enrollmentBlockedUntil = asTimestamp(getQuestsStore()?.questEnrollmentBlockedUntil);
+    if (enrollmentBlockedUntil !== null && enrollmentBlockedUntil > Date.now()) return;
+
     const quests = getAllQuests().filter(isEnrollmentEligible).sort(sortByExpiry);
 
     for (let index = 0; index < quests.length && isCurrentRuntime(state); index++) {
         const quest = quests[index];
-        if (hasUnexpiredMarker(state.successfulEnrollments, quest.id) || !retryReady(state.enrollRetries, quest.id)) continue;
+        if (
+            hasUnexpiredMarker(state.successfulEnrollments, quest.id)
+            || state.blockedQuestIds.has(quest.id)
+            || !retryReady(state.enrollRetries, quest.id)
+        ) continue;
 
         const questName = getQuestName(quest);
         try {
+            const currentBlockUntil = asTimestamp(getQuestsStore()?.questEnrollmentBlockedUntil);
+            if (currentBlockUntil !== null && currentBlockUntil > Date.now()) break;
+
             await RestAPI.post({
                 url: `/quests/${quest.id}/enroll`,
                 body: { location: 11, is_targeted: false }
@@ -507,6 +719,12 @@ async function autoEnroll(state: RuntimeState): Promise<void> {
             scheduleCycle(state, ACTION_DELAY_MS);
         } catch (error) {
             if (!isCurrentRuntime(state)) return;
+            if (isTerminalQuestError(error)) {
+                state.blockedQuestIds.add(quest.id);
+                state.enrollRetries.delete(quest.id);
+                logger.warn(`Discord rejected enrollment for ${questName}; waiting for a quest status refresh.`);
+                continue;
+            }
             const retry = markRetry(state.enrollRetries, quest.id, 60_000, 15 * 60_000);
             logger.warn(`Failed to enroll in ${questName}: ${getErrorSummary(error)}. Retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
         }
@@ -515,9 +733,23 @@ async function autoEnroll(state: RuntimeState): Promise<void> {
     }
 }
 
-function responseHasRewardErrors(response: unknown): boolean {
-    if (!isRecord(response) || !isRecord(response.body)) return false;
-    return Array.isArray(response.body.errors) && response.body.errors.length > 0;
+function startEnrollmentQueue(state: RuntimeState): void {
+    if (!isCurrentRuntime(state) || state.enrollQueuePromise) return;
+
+    const enrollQueuePromise = autoEnroll(state)
+        .catch(error => {
+            if (isCurrentRuntime(state)) {
+                logger.error(`Quest enrollment queue failed: ${getErrorSummary(error)}`);
+            }
+        })
+        .finally(() => {
+            if (state.enrollQueuePromise !== enrollQueuePromise) return;
+            state.enrollQueuePromise = null;
+            if (isCurrentRuntime(state)) scheduleCycle(state, 250);
+            emitRuntimeChange();
+        });
+
+    state.enrollQueuePromise = enrollQueuePromise;
 }
 
 async function autoClaim(state: RuntimeState): Promise<void> {
@@ -525,48 +757,118 @@ async function autoClaim(state: RuntimeState): Promise<void> {
 
     for (let index = 0; index < quests.length && isCurrentRuntime(state); index++) {
         const quest = quests[index];
-        if (state.successfulClaims.has(quest.id) || !retryReady(state.claimRetries, quest.id)) continue;
+        if (
+            state.successfulClaims.has(quest.id)
+            || state.inFlightClaims.has(quest.id)
+            || !retryReady(state.claimRetries, quest.id)
+        ) continue;
+
+        const rewards = quest.config.rewardsConfig?.rewards;
+        const platformDecision = selectClaimPlatform(quest.config.rewardsConfig?.platforms, rewards);
+        if (platformDecision.kind === "invalid") {
+            const retry = markRetry(state.claimRetries, quest.id, 30 * 60_000, 6 * 60 * 60_000);
+            logger.warn(`Discord returned an unknown reward schema for ${getQuestName(quest)}; automatic retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
+            continue;
+        }
 
         const questName = getQuestName(quest);
+        state.claimNames.set(quest.id, questName);
+        state.inFlightClaims.add(quest.id);
+        emitRuntimeChange();
         try {
-            const response = await RestAPI.post({
-                url: `/quests/${quest.id}/claim-reward`,
-                body: {
-                    platform: 0,
-                    location: 11,
-                    is_targeted: false,
-                    metadata_raw: null,
-                    metadata_sealed: null,
-                    traffic_metadata_raw: null,
-                    traffic_metadata_sealed: null
-                }
-            });
+            // Use Discord's own action creator so the request carries whatever
+            // current ad-decision metadata applies and remains inside Discord's
+            // built-in CAPTCHA interceptor. Challenge values never enter this plugin.
+            const claimLocation = selectClaimLocation(rewards);
+            logger.info(`Submitting Discord's native reward claim for: ${questName}`);
+            const response = await claimQuestReward(quest.id, platformDecision.platform, claimLocation);
             if (!isCurrentRuntime(state)) return;
-            if (responseHasRewardErrors(response)) throw new Error("Discord returned one or more reward errors");
 
-            state.successfulClaims.add(quest.id);
-            state.claimRetries.delete(quest.id);
-            logger.info(`Auto-claimed reward for: ${questName}`);
-
-            try {
-                await recordCompletion(quest.id, questName);
-            } catch (error) {
-                logger.error(`Claimed ${questName}, but failed to update local stats: ${getErrorSummary(error)}`);
+            const assessment = assessClaimResponse(response);
+            if (assessment.kind === "rewardErrors") {
+                if (await waitForClaimReconciliation(state, quest.id)) {
+                    await finalizeClaim(state, quest);
+                    logger.info(`Auto-claimed reward for: ${questName}`);
+                    continue;
+                }
+                if (await tryRecoverRewardCodeClaim(state, quest)) {
+                    await finalizeClaim(state, quest);
+                    logger.info(`Recovered and confirmed reward-code claim for: ${questName}`);
+                    continue;
+                }
+                const retry = markRetry(state.claimRetries, quest.id, 30 * 60_000, 6 * 60 * 60_000);
+                logger.warn(`Discord returned reward errors for ${questName}; automatic retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
+                continue;
             }
+            if (assessment.kind === "invalid" && !await waitForClaimReconciliation(state, quest.id)) {
+                throw new Error("Discord returned an invalid claim response");
+            }
+            if (assessment.kind === "pending" && !await waitForClaimReconciliation(state, quest.id)) {
+                throw new Error("Discord did not confirm the claim in time");
+            }
+
+            await finalizeClaim(state, quest);
+            logger.info(`Auto-claimed reward for: ${questName}`);
         } catch (error) {
             if (!isCurrentRuntime(state)) return;
-            const retry = markRetry(state.claimRetries, quest.id, 15 * 60_000, 60 * 60_000);
-            logger.warn(`Failed to claim ${questName}: ${getErrorSummary(error)}. A CAPTCHA may require manual claiming; retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
+            const failure = isDiscordCaptchaCancelError(error)
+                ? { kind: "captcha" as const, status: null }
+                : classifyClaimFailure(error);
+            if (failure.kind !== "captcha" && await tryRecoverRewardCodeClaim(state, quest)) {
+                await finalizeClaim(state, quest);
+                logger.info(`Recovered and confirmed reward-code claim for: ${questName}`);
+                continue;
+            }
+            if (failure.kind === "captcha") {
+                const retry = markRetry(state.claimRetries, quest.id, 15 * 60_000, 60 * 60_000);
+                logger.warn(`Discord's native reward confirmation was dismissed for ${questName}; automatic retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
+            } else if (failure.kind === "alreadyClaimed" && hasTimestamp(getQuestById(quest.id)?.userStatus?.claimedAt)) {
+                await finalizeClaim(state, quest);
+            } else if (failure.kind === "alreadyClaimed" || failure.kind === "terminal") {
+                const retry = markRetry(
+                    state.claimRetries,
+                    quest.id,
+                    failure.kind === "alreadyClaimed" ? 5 * 60_000 : 30 * 60_000,
+                    failure.kind === "alreadyClaimed" ? 30 * 60_000 : 6 * 60 * 60_000
+                );
+                logger.warn(`Discord rejected automatic claiming for ${questName} (${getErrorSummary(error)}); automatic retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
+            } else {
+                const retry = markRetry(state.claimRetries, quest.id, 15 * 60_000, 60 * 60_000);
+                logger.warn(`Failed to claim ${questName}: ${getErrorSummary(error)}. Retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
+            }
+        } finally {
+            state.inFlightClaims.delete(quest.id);
+            emitRuntimeChange();
         }
 
         if (index < quests.length - 1) await sleep(ACTION_DELAY_MS, state.controller.signal);
     }
 }
 
+function startClaimQueue(state: RuntimeState): void {
+    if (!isCurrentRuntime(state) || state.claimQueuePromise) return;
+
+    const claimQueuePromise = autoClaim(state)
+        .catch(error => {
+            if (isCurrentRuntime(state)) {
+                logger.error(`Reward claim queue failed: ${getErrorSummary(error)}`);
+            }
+        })
+        .finally(() => {
+            if (state.claimQueuePromise !== claimQueuePromise) return;
+            state.claimQueuePromise = null;
+            if (isCurrentRuntime(state)) scheduleCycle(state, 250);
+            emitRuntimeChange();
+        });
+
+    state.claimQueuePromise = claimQueuePromise;
+    emitRuntimeChange();
+}
+
 function getResponseStatus(response: unknown): QuestUserStatus | null {
     if (!isRecord(response)) return null;
     const body = isRecord(response.body) ? response.body : response;
-    const nested = body.userStatus ?? body.user_status;
+    const nested = body.userStatus ?? body.user_status ?? body.questUserStatus ?? body.quest_user_status;
     return isRecord(nested) ? nested as QuestUserStatus : body as QuestUserStatus;
 }
 
@@ -585,6 +887,7 @@ function getResponseProgress(response: unknown, taskName: TaskName): number | nu
 
 async function completeVideoQuest(job: QuestJob, quest: Quest, task: TaskSelection): Promise<boolean> {
     let { progress } = task;
+    let submittedProgress = progress;
     const enrolledAt = Math.min(Date.now(), asTimestamp(quest.userStatus?.enrolledAt) ?? Date.now() - progress * 1000);
     const deadline = Date.now() + Math.min(MAX_QUEST_TIMEOUT_MS, Math.max(5 * 60_000, (task.target - progress) * 1000 + QUEST_TIMEOUT_BUFFER_MS));
     let failures = 0;
@@ -593,10 +896,14 @@ async function completeVideoQuest(job: QuestJob, quest: Quest, task: TaskSelecti
         const refreshed = getQuestById(quest.id);
         if (refreshed && hasTimestamp(refreshed.userStatus?.completedAt)) return true;
         if (refreshed && !isQuestActive(refreshed)) return false;
+        if (refreshed) {
+            progress = Math.min(task.target, Math.max(progress, getProgress(refreshed.userStatus, task.name, refreshed.config.configVersion)));
+            if (progress >= task.target) return true;
+        }
 
-        const maxAllowed = Math.max(progress, Math.floor((Date.now() - enrolledAt) / 1000) + 10);
-        const timestamp = Math.min(task.target, maxAllowed, progress + 7 + Math.random());
-        if (timestamp <= progress + 0.01) {
+        const maxAllowed = Math.max(submittedProgress, Math.floor((Date.now() - enrolledAt) / 1000) + 10);
+        const timestamp = Math.min(task.target, maxAllowed, submittedProgress + 7 + Math.random());
+        if (timestamp <= submittedProgress + 0.01) {
             await sleep(1000, job.controller.signal);
             continue;
         }
@@ -609,14 +916,18 @@ async function completeVideoQuest(job: QuestJob, quest: Quest, task: TaskSelecti
             if (!isJobActive(job)) return false;
 
             failures = 0;
-            progress = Math.min(task.target, Math.max(progress, getResponseProgress(response, task.name) ?? timestamp));
+            submittedProgress = Math.max(submittedProgress, timestamp);
+            const responseProgress = getResponseProgress(response, task.name);
+            const storeProgress = getProgress(getQuestById(quest.id)?.userStatus, task.name, quest.config.configVersion);
+            progress = Math.min(task.target, Math.max(progress, responseProgress ?? 0, storeProgress));
             logger.info(`Video quest progress for ${getQuestName(quest)}: ${Math.floor(progress)}/${task.target}`);
             if (responseCompleted(response) || progress >= task.target) return true;
         } catch (error) {
             if (!isJobActive(job)) return false;
             failures++;
             logger.warn(`Video progress error for ${getQuestName(quest)}: ${getErrorSummary(error)}`);
-            if (isTerminalQuestError(error) || failures >= 3) return false;
+            if (isTerminalQuestError(error)) throw new TerminalQuestError("Discord rejected video progress for this quest");
+            if (failures >= 3) return false;
             await sleep(3000, job.controller.signal);
             continue;
         }
@@ -632,8 +943,8 @@ function sanitizeExecutableName(value: string): string {
     return sanitized || "DiscordQuest.exe";
 }
 
-async function getFakeGameData(job: QuestJob, quest: Quest): Promise<{ name: string; exeName: string; }> {
-    const applicationId = getApplicationId(quest)!;
+async function getFakeGameData(job: QuestJob, quest: Quest, taskName: TaskName): Promise<{ name: string; exeName: string; }> {
+    const applicationId = getApplicationId(quest, taskName)!;
     const fallbackName = getApplicationName(quest);
 
     try {
@@ -658,13 +969,19 @@ async function getFakeGameData(job: QuestJob, quest: Quest): Promise<{ name: str
 
 function getEventQuestId(data: unknown): string | null {
     if (!isRecord(data)) return null;
-    const status = isRecord(data.userStatus) ? data.userStatus : null;
+    const status = isRecord(data.userStatus)
+        ? data.userStatus
+        : isRecord(data.user_status)
+            ? data.user_status
+            : null;
     const id = data.questId ?? data.quest_id ?? status?.questId ?? status?.quest_id;
     return isSnowflake(id) ? id : null;
 }
 
 function getEventStatus(data: unknown): QuestUserStatus | null {
-    return isRecord(data) && isRecord(data.userStatus) ? data.userStatus as QuestUserStatus : null;
+    if (!isRecord(data)) return null;
+    if (isRecord(data.userStatus)) return data.userStatus as QuestUserStatus;
+    return isRecord(data.user_status) ? data.user_status as QuestUserStatus : null;
 }
 
 function waitForHeartbeatCompletion(job: QuestJob, quest: Quest, task: TaskSelection): Promise<boolean> {
@@ -679,6 +996,7 @@ function waitForHeartbeatCompletion(job: QuestJob, quest: Quest, task: TaskSelec
             clearInterval(storePoll);
             job.controller.signal.removeEventListener("abort", onAbort);
             FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_FAILURE", onHeartbeatFailure);
             resolve(result);
         };
         const checkStatus = (status: QuestUserStatus | null | undefined) => {
@@ -692,6 +1010,9 @@ function waitForHeartbeatCompletion(job: QuestJob, quest: Quest, task: TaskSelec
             if (eventQuestId === quest.id) checkStatus(getEventStatus(data) ?? getQuestById(quest.id)?.userStatus);
             else checkStatus(getQuestById(quest.id)?.userStatus);
         };
+        const onHeartbeatFailure = (data: unknown) => {
+            if (getEventQuestId(data) === quest.id) finish(false);
+        };
         const onAbort = () => finish(false);
         const timeout = setTimeout(() => finish(false), timeoutMs);
         const storePoll = setInterval(() => {
@@ -701,14 +1022,15 @@ function waitForHeartbeatCompletion(job: QuestJob, quest: Quest, task: TaskSelec
         }, 15_000);
 
         FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+        FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_FAILURE", onHeartbeatFailure);
         job.controller.signal.addEventListener("abort", onAbort, { once: true });
         addJobCleanup(job, onAbort);
     });
 }
 
 async function completePlayQuest(job: QuestJob, quest: Quest, task: TaskSelection): Promise<boolean> {
-    const applicationId = getApplicationId(quest)!;
-    const appData = await getFakeGameData(job, quest);
+    const applicationId = getApplicationId(quest, task.name)!;
+    const appData = await getFakeGameData(job, quest, task.name);
     if (!isJobActive(job)) return false;
 
     const store = RunningGameStore as unknown as {
@@ -768,7 +1090,7 @@ async function completePlayQuest(job: QuestJob, quest: Quest, task: TaskSelectio
 }
 
 async function completeStreamQuest(job: QuestJob, quest: Quest, task: TaskSelection): Promise<boolean> {
-    const applicationId = getApplicationId(quest)!;
+    const applicationId = getApplicationId(quest, task.name)!;
     const store = ApplicationStreamingStore as unknown as {
         getStreamerActiveStreamMetadata: () => unknown;
     };
@@ -821,13 +1143,54 @@ async function completeActivityQuest(job: QuestJob, quest: Quest, task: TaskSele
             if (!isJobActive(job)) return false;
             failures++;
             logger.warn(`Activity heartbeat error for ${getQuestName(quest)}: ${getErrorSummary(error)}`);
-            if (isTerminalQuestError(error) || failures >= 3) return false;
+            if (isTerminalQuestError(error)) throw new TerminalQuestError("Discord rejected activity heartbeats for this quest");
+            if (failures >= 3) return false;
         }
 
         await sleep(20_000, job.controller.signal);
     }
 
     return false;
+}
+
+function responseHasConsoleErrors(response: unknown): boolean {
+    if (!isRecord(response)) return true;
+    const body = isRecord(response.body) ? response.body : response;
+    return (Array.isArray(body.error_hints) && body.error_hints.length > 0)
+        || (Array.isArray(body.error_hints_v2) && body.error_hints_v2.length > 0);
+}
+
+async function completeConsoleQuest(job: QuestJob, quest: Quest, task: TaskSelection): Promise<boolean> {
+    const response = await RestAPI.post({ url: `/quests/${quest.id}/console/start` });
+    if (!isJobActive(job)) return false;
+
+    if (responseHasConsoleErrors(response)) {
+        logger.info(
+            `Discord could not start linked-console tracking for ${getQuestName(quest)}. `
+            + "Check the Xbox or PlayStation connection, online presence, and game privacy settings."
+        );
+        return false;
+    }
+
+    let stopped = false;
+    const stopTracking = () => {
+        if (stopped) return;
+        stopped = true;
+        if (!job.runtime.remoteCleanupAllowed) return;
+        void RestAPI.post({ url: `/quests/${quest.id}/console/stop` }).catch(error => {
+            logger.warn(`Could not stop linked-console tracking cleanly: ${getErrorSummary(error)}`);
+        });
+    };
+    addJobCleanup(job, stopTracking);
+
+    const status = getResponseStatus(response);
+    if (hasTimestamp(status?.completedAt) || getProgress(status, task.name) >= task.target) return true;
+
+    logger.info(
+        `Started linked-console tracking for ${getQuestName(quest)} (${task.name}). `
+        + "Keep the linked console account online and play the required game."
+    );
+    return waitForHeartbeatCompletion(job, quest, task);
 }
 
 async function runQuestJob(job: QuestJob, quest: Quest, task: TaskSelection): Promise<void> {
@@ -838,6 +1201,7 @@ async function runQuestJob(job: QuestJob, quest: Quest, task: TaskSelection): Pr
         let completed = false;
         switch (task.name) {
             case "WATCH_VIDEO":
+            case "WATCH_VIDEO_ON_MOBILE":
                 completed = await completeVideoQuest(job, quest, task);
                 break;
             case "PLAY_ON_DESKTOP":
@@ -848,6 +1212,10 @@ async function runQuestJob(job: QuestJob, quest: Quest, task: TaskSelection): Pr
                 break;
             case "PLAY_ACTIVITY":
                 completed = await completeActivityQuest(job, quest, task);
+                break;
+            case "PLAY_ON_XBOX":
+            case "PLAY_ON_PLAYSTATION":
+                completed = await completeConsoleQuest(job, quest, task);
                 break;
         }
 
@@ -862,6 +1230,13 @@ async function runQuestJob(job: QuestJob, quest: Quest, task: TaskSelection): Pr
         }
     } catch (error) {
         if (error instanceof CancelledError || !isJobActive(job)) return;
+        if (error instanceof TerminalQuestError || isTerminalQuestError(error)) {
+            job.runtime.blockedQuestIds.add(quest.id);
+            job.runtime.questRetries.delete(quest.id);
+            logger.warn(`Quest is blocked by Discord and will wait for a status change: ${questName}.`);
+            emitRuntimeChange();
+            return;
+        }
         const retry = markRetry(job.runtime.questRetries, quest.id, 60_000, 15 * 60_000);
         logger.error(`Quest failed: ${questName}: ${getErrorSummary(error)}. Retry after ${new Date(retry.retryAt).toLocaleTimeString()}.`);
     }
@@ -901,14 +1276,19 @@ async function runCycle(state: RuntimeState): Promise<void> {
         return;
     }
 
-    await autoEnroll(state);
-    if (!isCurrentRuntime(state)) return;
-    await autoClaim(state);
+    updateObservedSchema(state);
+
+    // Discord's global CAPTCHA interceptor can keep an enrollment or claim
+    // Promise pending. Isolate both serialized lanes so neither can pause
+    // unrelated quest-completion work.
+    startEnrollmentQueue(state);
+    startClaimQueue(state);
     if (!isCurrentRuntime(state) || state.activeJob) return;
 
     const quest = getAllQuests()
         .filter(isCompletionEligible)
         .filter(candidate => !hasUnexpiredMarker(state.completedQuestIds, candidate.id))
+        .filter(candidate => !state.blockedQuestIds.has(candidate.id))
         .filter(candidate => retryReady(state.questRetries, candidate.id))
         .sort(sortByExpiry)[0];
     if (!quest) return;
@@ -925,14 +1305,24 @@ function createRuntime(): RuntimeState {
         scheduledCycleAt: 0,
         cyclePromise: null,
         cycleQueued: false,
+        enrollQueuePromise: null,
+        claimQueuePromise: null,
         activeJob: null,
         successfulEnrollments: new Map(),
         successfulClaims: new Set(),
+        inFlightClaims: new Set(),
+        claimNames: new Map(),
         completedQuestIds: new Map(),
+        blockedQuestIds: new Set(),
         enrollRetries: new Map(),
         claimRetries: new Map(),
         questRetries: new Map(),
-        lastStoreWarningAt: 0
+        lastStoreWarningAt: 0,
+        observedSchemaFingerprint: "",
+        observedTaskNames: [],
+        observedUnsupportedTaskNames: [],
+        observedMobileHandoffs: 0,
+        remoteCleanupAllowed: true
     };
 }
 
@@ -946,6 +1336,7 @@ function stopRuntime(state: RuntimeState): void {
     state.cycleQueued = false;
     if (runtime === state) runtime = null;
     questsStore = null;
+    emitRuntimeChange();
 }
 
 function activateRuntime(initialDelay: number): RuntimeState {
@@ -964,12 +1355,56 @@ function handleConnectionOpen(): void {
     // began before an account/gateway reconnect becomes stale when it returns.
     // Aborting only the active progress job would still let the old cycle
     // mutate retry/dedup state for the newly connected account.
+    previous.remoteCleanupAllowed = false;
     stopRuntime(previous);
     activateRuntime(5000);
 }
 
 function scheduleStatusRefresh(): void {
     if (runtime) scheduleCycle(runtime, 250);
+}
+
+function handleQuestStatusRefresh(data?: unknown): void {
+    if (!runtime) return;
+    const questId = getEventQuestId(data);
+    if (questId) runtime.blockedQuestIds.delete(questId);
+    scheduleCycle(runtime, 250);
+}
+
+function handleFullQuestRefresh(): void {
+    if (!runtime) return;
+    runtime.blockedQuestIds.clear();
+    scheduleCycle(runtime, 250);
+}
+
+function handleTaskPlatformSelection(data?: unknown): void {
+    const state = runtime;
+    if (!state) return;
+    const questId = getEventQuestId(data);
+    if (questId) {
+        state.blockedQuestIds.delete(questId);
+        if (state.activeJob?.questId === questId) cancelActiveJob(state, "task platform changed");
+    }
+    scheduleCycle(state, 250);
+}
+
+function handleClaimSuccess(data?: unknown): void {
+    const state = runtime;
+    if (!state) return;
+    const questId = getEventQuestId(data);
+    if (!questId) {
+        scheduleCycle(state, 250);
+        return;
+    }
+
+    state.blockedQuestIds.delete(questId);
+    const quest = getQuestById(questId);
+    if (quest) void finalizeClaim(state, quest);
+    else {
+        const questName = state.claimNames.get(questId);
+        if (questName) void finalizeClaimDetails(state, questId, questName);
+    }
+    scheduleCycle(state, 250);
 }
 
 function StatsPanel() {
@@ -979,6 +1414,7 @@ function StatsPanel() {
     const [loaded, setLoaded] = useState(false);
     const [resetting, setResetting] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [, setRuntimeRevision] = useState(0);
 
     const refresh = async () => {
         try {
@@ -996,8 +1432,17 @@ function StatsPanel() {
 
     useEffect(() => {
         mounted.current = true;
+        const onRuntimeChange = () => {
+            if (!mounted.current) return;
+            setRuntimeRevision(revision => revision + 1);
+            void refresh();
+        };
+        runtimeListeners.add(onRuntimeChange);
         void refresh();
-        return () => { mounted.current = false; };
+        return () => {
+            mounted.current = false;
+            runtimeListeners.delete(onRuntimeChange);
+        };
     }, []);
 
     const handleReset = async () => {
@@ -1013,10 +1458,39 @@ function StatsPanel() {
     };
 
     if (!loaded) return <Forms.FormText>Loading stats...</Forms.FormText>;
+    const activeRuntime = runtime;
+    const pendingClaims = activeRuntime?.inFlightClaims.size ?? 0;
+    const activeQuest = activeRuntime?.activeJob ? getQuestById(activeRuntime.activeJob.questId) : null;
+    const activeTask = activeQuest ? getTaskSelection(activeQuest)?.name ?? "quest task" : null;
 
     return (
         <>
-            <Forms.FormTitle tag="h3">Quests completed: {count}</Forms.FormTitle>
+            <Forms.FormTitle tag="h3">Automation status</Forms.FormTitle>
+            <Forms.FormText role="status" aria-live="polite">
+                {!activeRuntime
+                    ? "Stopped"
+                    : activeTask
+                        ? `Working on ${activeTask}${pendingClaims ? "; native reward confirmation also pending" : ""}`
+                        : pendingClaims
+                            ? "Waiting for Discord's native reward confirmation"
+                            : "Running in the background"}
+            </Forms.FormText>
+            {activeRuntime?.observedTaskNames.length ? (
+                <Forms.FormText style={{ marginTop: 6 }}>
+                    Observed task types: {activeRuntime.observedTaskNames.join(", ")}
+                </Forms.FormText>
+            ) : null}
+            {activeRuntime?.observedUnsupportedTaskNames.length ? (
+                <Forms.FormText style={{ marginTop: 6, color: "var(--text-muted)" }}>
+                    Server-managed or not yet automatable: {activeRuntime.observedUnsupportedTaskNames.join(", ")}
+                </Forms.FormText>
+            ) : null}
+            {activeRuntime?.observedMobileHandoffs ? (
+                <Forms.FormText style={{ marginTop: 6, color: "var(--text-muted)" }}>
+                    Mobile or QR handoffs observed: {activeRuntime.observedMobileHandoffs}. These handoffs link or move a real session; they are not a Quest progress event that can be safely spoofed.
+                </Forms.FormText>
+            ) : null}
+            <Forms.FormTitle tag="h3" style={{ marginTop: 18 }}>Quests completed: {count}</Forms.FormTitle>
             {error && <Forms.FormText style={{ color: "var(--text-danger)" }}>{error}</Forms.FormText>}
             {history.length === 0 ? (
                 <Forms.FormText>No quests claimed yet.</Forms.FormText>
@@ -1053,7 +1527,7 @@ function StatsPanel() {
 
 export default definePlugin({
     name: "QuestCompleter",
-    description: "Fully autonomous quest handler that enrolls in, progresses, and claims eligible Discord quests in the background.",
+    description: "Handles compatible Discord quests, linked-console tracking, and reward claims through Discord's native challenge flow.",
     searchTerms: ["QuestComputer"],
     authors: [{
         name: "saintordevil",
@@ -1075,9 +1549,14 @@ export default definePlugin({
 
     flux: {
         CONNECTION_OPEN: handleConnectionOpen,
-        QUESTS_ENROLL_SUCCESS: scheduleStatusRefresh,
-        QUESTS_CLAIM_REWARD_SUCCESS: scheduleStatusRefresh,
-        QUESTS_USER_COMPLETION_UPDATE: scheduleStatusRefresh,
-        QUESTS_USER_STATUS_UPDATE: scheduleStatusRefresh
+        QUESTS_ENROLL_SUCCESS: handleQuestStatusRefresh,
+        QUESTS_ENROLL_FAILURE: scheduleStatusRefresh,
+        QUESTS_CLAIM_REWARD_FAILURE: scheduleStatusRefresh,
+        QUESTS_CLAIM_REWARD_SUCCESS: handleClaimSuccess,
+        QUESTS_FETCH_CURRENT_QUESTS_SUCCESS: handleFullQuestRefresh,
+        QUESTS_SELECT_TASK_PLATFORM: handleTaskPlatformSelection,
+        QUESTS_SEND_HEARTBEAT_FAILURE: scheduleStatusRefresh,
+        QUESTS_USER_COMPLETION_UPDATE: handleQuestStatusRefresh,
+        QUESTS_USER_STATUS_UPDATE: handleQuestStatusRefresh
     }
 });
